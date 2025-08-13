@@ -14,7 +14,7 @@ description = "MPS CausalConv1D (Metal) with simple Python interfaces"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
-    {name = "causal_conv1d_mps", email = "example@example.com"},
+    {name = "Zhonghan Li", email = "lizhonghan@qq.com"},
 ]
 keywords = ["pytorch", "mps", "metal", "convolution", "causal", "deep-learning"]
 classifiers = [
