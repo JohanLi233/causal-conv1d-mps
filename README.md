@@ -29,7 +29,7 @@ If `torch.backends.mps.is_available()` returns False, please enable MPS per PyTo
 Run at the repository root:
 
 ```bash
-pip install -e .
+uv pip install -e .
 ```
 
 Notes:

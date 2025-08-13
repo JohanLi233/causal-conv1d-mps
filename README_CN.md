@@ -29,7 +29,7 @@ Apple Silicon 上基于 Metal/MPS 的 PyTorch 因果一维卷积（CausalConv1D�
 在项目根目录执行：
 
 ```bash
-pip install -e .
+uv pip install -e .
 
 
 > 说明
