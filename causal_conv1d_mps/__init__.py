@@ -159,7 +159,7 @@ def short_conv_fused(
     residual: bool = True,
 ) -> torch.Tensor:
     """
-    Fused short convolution operation (optimized for HuggingFace-style usage).
+    Fused short convolution operation for common (B, T, D) layout usage.
 
     Args:
         x: Input tensor of shape (batch, seqlen, dim)
@@ -236,18 +236,18 @@ def short_conv_fused(
         bias = torch.tensor([], device=x.device, dtype=x.dtype)
 
     if attention_mask is not None:
-        # 统一 mask 的 dtype 与形状到 (B, T)
+        # Normalize mask dtype and shape to (B, T)
         B, T, D = x.shape
         m = attention_mask
-        # dtype 对齐
+        # Align dtype
         if m.dtype == torch.bool:
             m = m.to(dtype=x.dtype)
         else:
             m = m.to(dtype=x.dtype)
-        # 尝试压缩 size=1 维度
+        # Try squeezing dimensions with size=1
         if m.dim() > 2:
             m = m.squeeze()
-        # 现在接受 1D 或 2D
+        # Now accept 1D or 2D
         if m.dim() == 1:
             if m.numel() == T:
                 m = m.view(1, T).expand(B, T)
@@ -277,23 +277,23 @@ def short_conv_fused(
                 f"Attention mask dim {m.dim()} not supported; expected 1D/2D convertible to (B, T)"
             )
 
-        # 若仍与 (B, T) 的第二维不一致，则进行截断/扩展（优先截取末尾对齐当前序列长度）
+        # If still mismatched with (B, T), truncate/expand (prefer tail alignment with current sequence length)
         if m.shape[0] != B:
             raise ValueError(f"Attention mask batch {m.shape[0]} != input batch {B}")
         if m.shape[1] != T:
             if m.shape[1] > T:
-                # 通常出现在 generate 步（T=1）但传入完整历史 mask 的情况
+                # Typically occurs in generate step (T=1) when passing a full history mask
                 m = m[:, -T:]
             elif m.shape[1] == 1:
                 m = m.expand(B, T)
             else:
-                # 若更短且不为 1，则无法可靠广播
+                # If shorter and not equal to 1, reliable broadcasting is not possible
                 raise ValueError(
                     f"Attention mask time {m.shape[1]} cannot match input time {T}"
                 )
         attention_mask = m.contiguous()
     else:
-        # 未提供 mask 时，创建满 1 的 (B, T) 掩码，避免旧版扩展对空张量形状检查失败
+        # When no mask is provided, create an all-ones (B, T) mask to avoid shape checks on empty tensors in older extensions
         B, T, _ = x.shape
         attention_mask = torch.ones((B, T), device=x.device, dtype=x.dtype)
 

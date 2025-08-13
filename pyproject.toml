@@ -32,6 +32,8 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
+  "numpy>=2.2.6",
+  "pytest>=8.4.1",
   "torch>=2.1",
 ]
 

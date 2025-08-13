@@ -233,7 +233,7 @@ class ShortConvFusedMPSFunction(torch.autograd.Function):
         else:
             bias = torch.tensor([], device=x.device, dtype=x.dtype)
 
-        # Handle attention mask processing (from original implementation)
+        # Handle attention mask processing (normalized to (B, T))
         if attention_mask is not None:
             B, T, D = x.shape
             m = attention_mask

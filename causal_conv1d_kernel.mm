@@ -9,11 +9,11 @@
 #include <cstring>
 #include <unordered_map>
 
-// 缓存 Metal 设备、队列与管线，避免重复初始化开销
+// Cache Metal device, queue, and pipelines to avoid repeated initialization overhead
 static id<MTLDevice> g_device = nil;
 static std::unordered_map<std::string, id<MTLComputePipelineState>> g_pipelines;
 
-// 卷积参数结构体
+// Convolution parameter struct
 struct ConvParams {
     int batch_size;
     int dim;
@@ -40,7 +40,7 @@ static void ensure_metal_pipeline_initialized(id<MTLDevice> device) {
   g_device = device;
   TORCH_CHECK(g_device, "Failed to get default MTLDevice");
 
-  // 加载并编译 Metal 源码
+  // Load and compile Metal source
   std::ifstream file("causal_conv1d.metal");
   if (!file.good()) {
     const char *alt = std::getenv("CAUSAL_CONV1D_METAL_PATH");
@@ -60,7 +60,7 @@ static void ensure_metal_pipeline_initialized(id<MTLDevice> device) {
   TORCH_CHECK(library, "Failed to compile Metal library: ",
               [[error localizedDescription] UTF8String]);
 
-  // 创建不同的计算管线
+  // Create compute pipelines
   std::vector<std::string> function_names = {
     "causal_conv1d_fwd_kernel",
     "causal_conv1d_simple_kernel",
@@ -102,7 +102,7 @@ static void ensure_metal_pipeline_initialized(id<MTLDevice> device) {
   }
 }
 
-// 设置卷积参数
+// Setup convolution parameters
 static ConvParams setup_conv_params(
     const torch::Tensor &x, 
     const torch::Tensor &weight,
@@ -111,14 +111,14 @@ static ConvParams setup_conv_params(
 ) {
     ConvParams params;
     
-    // 基本维度
+    // Basic dimensions
     params.batch_size = x.size(0);
     params.dim = x.size(1);
     params.seqlen = x.size(2);
     params.width = weight.size(1);
     params.silu_activation = silu_activation;
     
-    // 步长信息
+    // Strides
     params.x_batch_stride = x.stride(0);
     params.x_c_stride = x.stride(1);
     params.x_l_stride = x.stride(2);
@@ -131,14 +131,14 @@ static ConvParams setup_conv_params(
     return params;
 }
 
-// MPS causal conv1d 内核的 C++ 封装
+// C++ wrapper for MPS causal conv1d kernel
 torch::Tensor causal_conv1d_fwd_mps(
     const torch::Tensor &x, 
     const torch::Tensor &weight,
     const torch::Tensor &bias,
     bool silu_activation = false
 ) {
-  // 输入验证
+  // Input validation
   TORCH_CHECK(x.device().is_mps(), "Tensor 'x' must be a MPS tensor");
   TORCH_CHECK(weight.device().is_mps(), "Tensor 'weight' must be a MPS tensor");
   TORCH_CHECK(x.is_contiguous(), "Tensor 'x' must be contiguous");
@@ -151,7 +151,7 @@ torch::Tensor causal_conv1d_fwd_mps(
       weight.scalar_type() == x.scalar_type(),
       "weight dtype must match x dtype");
   
-  // 检查形状
+  // Shape checks
   TORCH_CHECK(x.dim() == 3, "Input tensor must have shape (batch, dim, seqlen)");
   TORCH_CHECK(weight.dim() == 2, "Weight tensor must have shape (dim, width)");
   TORCH_CHECK(x.size(1) == weight.size(0), "Input dim must match weight dim");
@@ -173,30 +173,30 @@ torch::Tensor causal_conv1d_fwd_mps(
     return torch::empty_like(x);
   }
 
-  // 使用 PyTorch 的当前 MPS 流
+  // Use PyTorch current MPS stream
   at::mps::MPSStream* stream = at::mps::getCurrentMPSStream();
   id<MTLDevice> device = (id<MTLDevice>)stream->device();
   ensure_metal_pipeline_initialized(device);
 
-  // 创建输出张量
+  // Create output tensor
   auto result_tensor = torch::empty_like(x);
   
-  // 获取 Metal 缓冲区
+  // Get Metal buffers
   id<MTLBuffer> x_buffer = (id<MTLBuffer>)x.storage().data();
   id<MTLBuffer> weight_buffer = (id<MTLBuffer>)weight.storage().data();
   id<MTLBuffer> bias_buffer = (bias.defined() && bias.numel() > 0) ? (id<MTLBuffer>)bias.storage().data() : nil;
   id<MTLBuffer> result_buffer = (id<MTLBuffer>)result_tensor.storage().data();
   
-  // 计算偏移
+  // Compute byte offsets
   const NSUInteger x_offset = (NSUInteger)(x.storage_offset() * x.element_size());
   const NSUInteger weight_offset = (NSUInteger)(weight.storage_offset() * weight.element_size());
   const NSUInteger bias_offset = (bias.defined() && bias.numel() > 0) ? (NSUInteger)(bias.storage_offset() * bias.element_size()) : 0;
   const NSUInteger result_offset = (NSUInteger)(result_tensor.storage_offset() * result_tensor.element_size());
 
-  // 注意：这里移除了未使用的params变量，因为我们使用的是简化kernel
+  // Note: removed unused params as we use a simplified kernel
   // ConvParams params = setup_conv_params(x, weight, result_tensor, silu_activation);
 
-  // 选择合适的kernel（按 dtype）
+  // Select kernel by dtype
   id<MTLComputePipelineState> pipeline = nil;
   if (x.scalar_type() == torch::kFloat) {
     pipeline = g_pipelines["causal_conv1d_simple_kernel"];
@@ -208,11 +208,11 @@ torch::Tensor causal_conv1d_fwd_mps(
     TORCH_CHECK(false, "Unsupported dtype");
   }
   
-  // 编码计算命令
+  // Encode compute command
   id<MTLComputeCommandEncoder> encoder = (id<MTLComputeCommandEncoder>)stream->commandEncoder();
   [encoder setComputePipelineState:pipeline];
   
-  // 设置缓冲区
+  // Set buffers
   [encoder setBuffer:x_buffer offset:x_offset atIndex:0];
   [encoder setBuffer:weight_buffer offset:weight_offset atIndex:1];
   if (bias_buffer != nil) {
@@ -222,7 +222,7 @@ torch::Tensor causal_conv1d_fwd_mps(
   }
   [encoder setBuffer:result_buffer offset:result_offset atIndex:3];
   
-  // 设置参数
+  // Set parameters
   uint32_t batch_u32 = (uint32_t)batch_size;
   uint32_t dim_u32 = (uint32_t)dim;
   uint32_t seqlen_u32 = (uint32_t)seqlen;
@@ -233,13 +233,13 @@ torch::Tensor causal_conv1d_fwd_mps(
   [encoder setBytes:&seqlen_u32 length:sizeof(uint32_t) atIndex:6];
   [encoder setBytes:&silu_flag length:sizeof(bool) atIndex:7];
 
-  // 计算线程组大小
-  // 使用 3D 网格: (batch_size, dim, seqlen)
+  // Compute threadgroup size
+  // Use 3D grid: (batch_size, dim, seqlen)
   MTLSize gridSize = MTLSizeMake((NSUInteger)batch_size, (NSUInteger)dim, (NSUInteger)seqlen);
   
-  // 选择线程组大小
+  // Choose threadgroup size (conservative)
   NSUInteger maxThreadsPerGroup = [pipeline maxTotalThreadsPerThreadgroup];
-  NSUInteger threadsPerGroup = MIN(256, maxThreadsPerGroup); // 保守的线程组大小
+  NSUInteger threadsPerGroup = MIN(256, maxThreadsPerGroup);
   MTLSize threadgroupSize = MTLSizeMake(1, 1, threadsPerGroup);
   
   [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
@@ -247,7 +247,7 @@ torch::Tensor causal_conv1d_fwd_mps(
   return result_tensor;
 }
 
-// 简化的接口函数，匹配 PyTorch autograd function 的期望
+// Simplified interface function to match PyTorch autograd function expectations
 torch::Tensor causal_conv1d_mps(
     const torch::Tensor &x,
     const torch::Tensor &weight,
@@ -257,11 +257,11 @@ torch::Tensor causal_conv1d_mps(
     const torch::Tensor &final_states_out,
     bool silu_activation
 ) {
-    // 目前只实现基础功能，忽略高级参数
+    // Only basic functionality is implemented; advanced parameters are ignored
     return causal_conv1d_fwd_mps(x, weight, bias, silu_activation);
 }
 
-// 安全获取 MTLBuffer 与 offset 的辅助函数
+// Helper to safely get MTLBuffer and offset
 static inline std::pair<id<MTLBuffer>, NSUInteger> getBufferAndOffset(const torch::Tensor& t) {
     if (!t.defined() || t.numel() == 0) return {nil, 0};
     id<MTLBuffer> buffer = (id<MTLBuffer>)t.storage().data();
@@ -288,9 +288,9 @@ torch::Tensor short_conv_fused_mps(
           x.scalar_type() == torch::kBFloat16,
       "Only float32/float16/bfloat16 supported for x");
   TORCH_CHECK(weight.scalar_type() == x.scalar_type(), "weight dtype must match x");
-  // 允许 bias 为未定义或空张量作为“无偏置”的标记
+  // Allow bias to be undefined or empty as a marker of no-bias
   TORCH_CHECK(!bias.defined() || bias.numel() == 0 || bias.scalar_type() == x.scalar_type(), "bias dtype must match x");
-  // 若 mask 未定义或为空张量则跳过 dtype 校验
+  // If mask is undefined or empty, skip dtype check
   TORCH_CHECK(
       !mask.defined() || mask.numel() == 0 || mask.scalar_type() == x.scalar_type(),
       "mask dtype must match x");
@@ -419,7 +419,7 @@ torch::Tensor short_conv_update_mps(
       "Only float32/float16/bfloat16 supported for x");
   TORCH_CHECK(conv_state.scalar_type() == x.scalar_type(), "conv_state dtype must match x");
   TORCH_CHECK(weight.scalar_type() == x.scalar_type(), "weight dtype must match x");
-  // 允许 bias 为未定义或空张量
+  // Allow bias to be undefined or empty
   TORCH_CHECK(!bias.defined() || bias.numel() == 0 || bias.scalar_type() == x.scalar_type(), "bias dtype must match x");
   TORCH_CHECK(cache_seqlens.scalar_type() == torch::kInt, "cache_seqlens must be int32");
 

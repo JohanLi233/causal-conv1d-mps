@@ -2,18 +2,18 @@
 using namespace metal;
 
 kernel void causal_conv1d_fwd_kernel(
-    device const float *input [[buffer(0)]],            // 输入张量 (batch, dim, seqlen)
-    device const float *weight [[buffer(1)]],           // 权重 (dim, width)
-    device const float *bias [[buffer(2)]],             // 偏置 (dim) - 可为 nullptr
-    device float *output [[buffer(3)]],                 // 输出张量 (batch, dim, seqlen)
+    device const float *input [[buffer(0)]],            // input tensor (batch, dim, seqlen)
+    device const float *weight [[buffer(1)]],           // weights (dim, width)
+    device const float *bias [[buffer(2)]],             // bias (dim) - can be nullptr
+    device float *output [[buffer(3)]],                 // output tensor (batch, dim, seqlen)
     
     constant uint &batch_size [[buffer(4)]],
     constant uint &dim [[buffer(5)]],
     constant uint &seqlen [[buffer(6)]],
     constant uint &width [[buffer(7)]],
-    constant uint &silu_activation [[buffer(8)]],       // 是否启用 SiLU 激活
+    constant uint &silu_activation [[buffer(8)]],       // whether to use SiLU activation
     
-    // Strides (以元素为单位)
+    // Strides (in elements)
     constant uint &x_batch_stride [[buffer(9)]],
     constant uint &x_c_stride [[buffer(10)]],
     constant uint &x_l_stride [[buffer(11)]],
@@ -28,33 +28,33 @@ kernel void causal_conv1d_fwd_kernel(
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]
 )
 {
-    // 线程组织：每个 threadgroup 处理一个 (batch_id, channel_id) 对
+    // Thread organization: each threadgroup handles a (batch_id, channel_id) pair
     const uint batch_id = threadgroup_position_in_grid.x;
     const uint channel_id = threadgroup_position_in_grid.y;
     const uint thread_id = thread_position_in_grid.x % threads_per_threadgroup.x;
     
-    // 边界检查
+    // Boundary check
     if (batch_id >= batch_size || channel_id >= dim) {
         return;
     }
     
-    // 计算数据指针偏移
+    // Calculate data pointer offsets
     device const float *x = input + batch_id * x_batch_stride + channel_id * x_c_stride;
     device const float *w = weight + channel_id * weight_c_stride;
     device float *out = output + batch_id * out_batch_stride + channel_id * out_c_stride;
     
-    // 获取偏置值
+    // Get bias value
     float bias_val = (bias != nullptr) ? bias[channel_id] : 0.0f;
     
-    // 预加载权重值
-    float weight_vals[4];  // 固定 width=4 的简化版本
-    // 使用 min 确保不会越界读取
+    // Preload weight values
+    float weight_vals[4];  // fixed width=4 simplified version
+    // Use min to ensure no out-of-bounds reads
     uint effective_width = min(width, (uint)4);
     for (uint i = 0; i < effective_width; i++) {
         weight_vals[i] = w[i * weight_width_stride];
     }
     
-    // 每个线程处理多个序列位置
+    // Each thread handles multiple sequence positions
     const uint elements_per_thread = 4;
     const uint total_threads = threads_per_threadgroup.x;
     const uint chunk_size = total_threads * elements_per_thread;
@@ -64,14 +64,14 @@ kernel void causal_conv1d_fwd_kernel(
         const uint chunk_start = chunk * chunk_size;
         const uint thread_start = chunk_start + thread_id * elements_per_thread;
         
-        // 处理当前线程的元素
+        // Process elements for the current thread
         for (uint elem = 0; elem < elements_per_thread; elem++) {
             uint pos = thread_start + elem;
             if (pos >= seqlen) break;
             
             float result = bias_val;
             
-            // 因果卷积：只使用当前和之前的输入 (Convention B)
+            // Causal convolution: only use current and previous inputs (Convention B)
             for (uint w_idx = 0; w_idx < effective_width; w_idx++) {
                 int input_pos = (int)pos - (int)(effective_width - 1 - w_idx);
                 if (input_pos >= 0) {
@@ -80,23 +80,23 @@ kernel void causal_conv1d_fwd_kernel(
                 }
             }
             
-            // 可选的 SiLU 激活函数
+            // Optional SiLU activation function
             if (silu_activation) {
                 result = result / (1.0f + exp(-result));
             }
             
-            // 存储结果
+            // Store result
             out[pos * out_l_stride] = result;
         }
     }
 }
 
-// SiLU 激活函数的辅助函数
+// SiLU activation function helper
 inline float silu(float x) {
     return x / (1.0f + exp(-x));
 }
 
-// BF16 <-> FP32 转换辅助函数
+// BF16 <-> FP32 conversion helper
 inline float bf16_to_float(ushort h) {
     uint u = (uint)h << 16;
     return as_type<float>(u);
@@ -105,28 +105,28 @@ inline float bf16_to_float(ushort h) {
 inline ushort float_to_bf16(float f) {
     uint u = as_type<uint>(f);
     
-    // 提取符号位并移到 BF16 的位置 (bit 15)
+    // Extract sign bit and move to BF16 position (bit 15)
     ushort sign_bit = (ushort)((u >> 16) & 0x8000);
 
-    // 增加鲁棒性：处理 NaN/Inf
-    // 检查指数是否为全1 (0xFF)
+    // Add robustness: handle NaN/Inf
+    // Check if exponent is all 1 (0xFF)
     if ((u & 0x7F800000) == 0x7F800000) {
         if ((u & 0x007FFFFF) != 0) {
-            // NaN (尾数非零) - 使用 Quiet NaN (0x7FC0)
+            // NaN (mantissa non-zero) - use Quiet NaN (0x7FC0)
             return sign_bit | 0x7FC0;
         } else {
-            // Infinity (尾数全零)
+            // Infinity (mantissa all zero)
             return sign_bit | 0x7F80;
         }
     }
 
-    // round-to-nearest-even (RNE) for finite numbers
+    // Round-to-nearest-even (RNE) for finite numbers
     uint lsb = (u >> 16) & 1u;
     u += 0x7FFFu + lsb;
     return (ushort)(u >> 16);
 }
 
-// 简化版本：固定 width=4，不使用状态管理
+// Simplified version: fixed width=4, no state management
 kernel void causal_conv1d_simple_kernel(
     device const float *input [[buffer(0)]],
     device const float *weight [[buffer(1)]],
@@ -141,25 +141,25 @@ kernel void causal_conv1d_simple_kernel(
     uint3 thread_position_in_grid [[thread_position_in_grid]]
 )
 {
-    // 每个线程处理一个输出位置
+    // Each thread handles one output position
     const uint batch_id = thread_position_in_grid.x;
     const uint channel_id = thread_position_in_grid.y;
     const uint seq_pos = thread_position_in_grid.z;
     
-    // 边界检查
+    // Boundary check
     if (batch_id >= batch_size || channel_id >= dim || seq_pos >= seqlen) {
         return;
     }
     
-    // 计算线性索引
+    // Calculate linear index
     const uint input_base = batch_id * dim * seqlen + channel_id * seqlen;
     const uint weight_base = channel_id * 4;  // width=4
     const uint output_idx = input_base + seq_pos;
     
-    // 获取偏置
+    // Get bias
     float result = (bias != nullptr) ? bias[channel_id] : 0.0f;
     
-    // 因果卷积：width=4
+    // Causal convolution: width=4
     const uint width = 4;
     for (uint w = 0; w < width; w++) {
         int input_pos = (int)seq_pos - (int)(width - 1 - w);
@@ -170,16 +170,16 @@ kernel void causal_conv1d_simple_kernel(
         }
     }
     
-    // 可选的 SiLU 激活
+    // Optional SiLU activation
     if (silu_activation) {
         result = silu(result);
     }
     
-    // 存储结果
+    // Store result
     output[output_idx] = result;
 }
 
-// 简化版本 (float16)：固定 width=4
+// Simplified version (float16): fixed width=4
 kernel void causal_conv1d_simple_kernel_f16(
     device const half *input [[buffer(0)]],
     device const half *weight [[buffer(1)]],
@@ -225,7 +225,7 @@ kernel void causal_conv1d_simple_kernel_f16(
     output[output_idx] = (half)result;
 }
 
-// 简化版本 (bfloat16)：固定 width=4
+// Simplified version (bfloat16): fixed width=4
 kernel void causal_conv1d_simple_kernel_bf16(
     device const ushort *input [[buffer(0)]],
     device const ushort *weight [[buffer(1)]],
@@ -273,20 +273,20 @@ kernel void causal_conv1d_simple_kernel_bf16(
 
 kernel void short_conv_fused_btd_kernel(
     // Inputs
-    device const float *input [[buffer(0)]],     // (B, T, D) 原始输入 (用于残差)
-    device const float *weight [[buffer(1)]],    // (D, W=4) 权重
-    device const float *bias [[buffer(2)]],      // (D) 偏置 (可选)
-    device const float *mask [[buffer(3)]],      // (B, T) Attention mask (可选)
-    device float *output [[buffer(4)]],          // (B, T, D) 输出张量
+    device const float *input [[buffer(0)]],     // (B, T, D) original input (for residual)
+    device const float *weight [[buffer(1)]],    // (D, W=4) weights
+    device const float *bias [[buffer(2)]],      // (D) bias (optional)
+    device const float *mask [[buffer(3)]],      // (B, T) Attention mask (optional)
+    device float *output [[buffer(4)]],          // (B, T, D) output tensor
 
-    // 参数
+    // Parameters
     constant uint &B [[buffer(5)]],
     constant uint &T [[buffer(6)]],
     constant uint &D [[buffer(7)]],
     constant bool &use_silu [[buffer(8)]],
     constant bool &use_residual [[buffer(9)]],
 
-    // 线程位置，网格组织为 (B, T, D)
+    // Thread position, grid organized as (B, T, D)
     uint3 gid [[thread_position_in_grid]]
 )
 {
@@ -294,27 +294,27 @@ kernel void short_conv_fused_btd_kernel(
     const uint t = gid.y;
     const uint d = gid.z;
 
-    // 边界检查
+    // Boundary check
     if (b >= B || t >= T || d >= D) return;
 
-    const uint W = 4; // 固定 width=4
+    const uint W = 4; // fixed width=4
     const uint TD = T * D;
 
-    // 线性索引 (BTD 布局步长: T*D, D, 1)
+    // Linear index (BTD layout stride: T*D, D, 1)
     const uint output_idx = b * TD + t * D + d;
     const uint weight_base = d * W;
 
-    // 1. 初始化 (读取偏置)
+    // 1. Initialize (read bias)
     float result = (bias != nullptr) ? bias[d] : 0.0f;
 
-    // 2. 因果卷积 + 融合 Masking
+    // 2. Causal convolution + fused Masking
     for (uint w = 0; w < W; w++) {
         int tt = (int)t - (int)(W - 1 - w);
         if (tt >= 0) {
             const uint input_idx = b * TD + (uint)tt * D + d;
             float input_val = input[input_idx];
 
-            // 融合 Masking: 在卷积前动态应用 mask (0 或 1)
+            // Fused Masking: apply mask (0 or 1) dynamically before convolution
             if (mask != nullptr) {
                 const uint mask_idx = b * T + (uint)tt;
                 input_val *= mask[mask_idx];
@@ -325,17 +325,17 @@ kernel void short_conv_fused_btd_kernel(
         }
     }
 
-    // 3. 可选 SiLU 激活
+    // 3. Optional SiLU activation
     if (use_silu) {
         result = silu(result);
     }
 
-    // 4. 残差连接
+    // 4. Residual connection
     if (use_residual) {
         result += input[output_idx];
     }
 
-    // 5. 写回输出
+    // 5. Write back output
     output[output_idx] = result;
 }
 
@@ -343,20 +343,20 @@ kernel void short_conv_fused_btd_kernel(
 // **OPTIMIZED**: Simplified indexing and removed global memory fallback.
 kernel void short_conv_fused_btd_kernel_tiled(
     // Inputs  
-    device const float *input [[buffer(0)]],    // (B, T, D) 原始输入
-    device const float *weight [[buffer(1)]],   // (D, W=4) 权重
-    device const float *bias [[buffer(2)]],     // (D) 偏置 (可选)
-    device const float *mask [[buffer(3)]],     // (B, T) Attention mask (可选)
-    device float *output [[buffer(4)]],         // (B, T, D) 输出张量
+    device const float *input [[buffer(0)]],    // (B, T, D) original input
+    device const float *weight [[buffer(1)]],   // (D, W=4) weights
+    device const float *bias [[buffer(2)]],     // (D) bias (optional)
+    device const float *mask [[buffer(3)]],     // (B, T) Attention mask (optional)
+    device float *output [[buffer(4)]],         // (B, T, D) output tensor
 
-    // 参数
+    // Parameters
     constant uint &B [[buffer(5)]],
     constant uint &T [[buffer(6)]],
     constant uint &D [[buffer(7)]],
     constant bool &use_silu [[buffer(8)]],
     constant bool &use_residual [[buffer(9)]],
 
-    // 线程组织和位置信息
+    // Thread organization and position information
     uint3 gid [[thread_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]],
     uint3 threads_per_threadgroup [[threads_per_threadgroup]],
@@ -367,7 +367,7 @@ kernel void short_conv_fused_btd_kernel_tiled(
     const uint t = gid.y;
     const uint d = gid.z;
     
-    const uint W = 4; // 固定 width=4
+    const uint W = 4; // fixed width=4
     const uint TD = T * D;
     
     // Threadgroup dimensions and tiling parameters
@@ -473,7 +473,7 @@ kernel void short_conv_fused_btd_kernel_tiled(
     output[output_idx] = result;
 }
 
-// Fused ShortConvolution (float16 版本)
+// Fused ShortConvolution (float16 version)
 kernel void short_conv_fused_btd_kernel_f16(
     device const half *input [[buffer(0)]],
     device const half *weight [[buffer(1)]],
@@ -526,7 +526,7 @@ kernel void short_conv_fused_btd_kernel_f16(
     output[output_idx] = (half)result;
 }
 
-// Fused ShortConvolution (bfloat16 版本)
+// Fused ShortConvolution (bfloat16 version)
 kernel void short_conv_fused_btd_kernel_bf16(
     device const ushort *input [[buffer(0)]],
     device const ushort *weight [[buffer(1)]],
@@ -584,17 +584,17 @@ kernel void short_conv_fused_btd_kernel_bf16(
 // ====================================================================================
 
 kernel void short_conv_update_kernel(
-    device const float *x [[buffer(0)]],              // 单步输入 (B, D) - 新的 token
-    device float *conv_state [[buffer(1)]],           // 卷积状态 (B, D, STATE_LEN) - 就地更新
-    device const float *weight [[buffer(2)]],         // 权重 (D, W)
-    device const float *bias [[buffer(3)]],           // 偏置 (D) - 可选
-    device const int *cache_seqlens [[buffer(4)]],    // 各 batch 的当前序列长度 (B,)
-    device float *output [[buffer(5)]],               // 单步输出 (B, D)
+    device const float *x [[buffer(0)]],              // single step input (B, D) - new token
+    device float *conv_state [[buffer(1)]],           // convolution state (B, D, STATE_LEN) - in-place update
+    device const float *weight [[buffer(2)]],         // weights (D, W)
+    device const float *bias [[buffer(3)]],           // bias (D) - optional
+    device const int *cache_seqlens [[buffer(4)]],    // current sequence length for each batch (B,)
+    device float *output [[buffer(5)]],               // single step output (B, D)
     
     constant uint &B [[buffer(6)]],                   // batch_size
     constant uint &D [[buffer(7)]],                   // hidden_dim
-    constant uint &W [[buffer(8)]],                   // kernel_width (固定为4)
-    constant uint &STATE_LEN [[buffer(9)]],           // 状态缓冲区长度
+    constant uint &W [[buffer(8)]],                   // kernel_width (fixed to 4)
+    constant uint &STATE_LEN [[buffer(9)]],           // state buffer length
     constant bool &use_silu [[buffer(10)]],
     constant bool &use_residual [[buffer(11)]],
     
@@ -604,37 +604,37 @@ kernel void short_conv_update_kernel(
     const uint b = gid.x;  // batch index
     const uint d = gid.y;  // dimension index
     
-    // 边界检查
+    // Boundary check
     if (b >= B || d >= D) return;
     
-    // 获取当前序列长度
+    // Get current sequence length
     int current_seq_len = cache_seqlens[b];
     
-    // 计算在循环缓冲区中的写入位置
+    // Calculate write position in circular buffer
     uint write_pos = (uint)current_seq_len % STATE_LEN;
     
-    // 计算线性索引
+    // Calculate linear index
     const uint x_idx = b * D + d;
     const uint output_idx = b * D + d;
     const uint weight_base = d * W;
     const uint state_base = b * D * STATE_LEN + d * STATE_LEN;
     
-    // 读取当前输入
+    // Read current input
     float current_input = x[x_idx];
     
-    // 初始化结果为偏置
+    // Initialize result to bias
     float result = (bias != nullptr) ? bias[d] : 0.0f;
     
-    // 执行因果卷积：需要读取过去 W-1 个状态 + 当前输入
+    // Execute causal convolution: need to read past W-1 states + current input
     for (uint w = 0; w < W; w++) {
         float input_val;
         
         if (w == W - 1) {
-            // 最后一个权重对应当前输入
+            // Last weight corresponds to current input
             input_val = current_input;
         } else {
-            // 从循环缓冲区读取历史数据
-            // 位置计算：(write_pos - (W - 1 - w)) % STATE_LEN
+            // Read history data from circular buffer
+            // Position calculation: (write_pos - (W - 1 - w)) % STATE_LEN
             int hist_offset = (int)(W - 1 - w);
             int hist_pos = ((int)write_pos - hist_offset + (int)STATE_LEN) % (int)STATE_LEN;
             uint state_idx = state_base + (uint)hist_pos;
@@ -645,25 +645,25 @@ kernel void short_conv_update_kernel(
         result += weight_val * input_val;
     }
     
-    // 应用激活函数
+    // Apply activation function
     if (use_silu) {
         result = silu(result);
     }
     
-    // 应用残差连接
+    // Apply residual connection
     if (use_residual) {
         result += current_input;
     }
     
-    // 更新状态：将当前输入写入循环缓冲区
+    // Update state: write current input to circular buffer
     uint state_write_idx = state_base + write_pos;
     conv_state[state_write_idx] = current_input;
     
-    // 写入输出
+    // Write output
     output[output_idx] = result;
 }
 
-// Float16 版本
+// Float16 version
 kernel void short_conv_update_kernel_f16(
     device const half *x [[buffer(0)]],
     device half *conv_state [[buffer(1)]],
@@ -728,7 +728,7 @@ kernel void short_conv_update_kernel_f16(
     output[output_idx] = (half)result;
 }
 
-// BFloat16 版本  
+// BFloat16 version
 kernel void short_conv_update_kernel_bf16(
     device const ushort *x [[buffer(0)]],
     device ushort *conv_state [[buffer(1)]],
