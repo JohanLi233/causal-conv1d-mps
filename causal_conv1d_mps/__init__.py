@@ -417,3 +417,13 @@ def short_conv_update(
     return _C.short_conv_update(
         x, conv_state, weight, bias, cache_seqlens, activation, residual
     )
+
+
+# Rename the forward-only functions to make it clear they don't have gradients
+short_conv_fused_fwd_only = short_conv_fused
+short_conv_update_fwd_only = short_conv_update
+
+# Replace the public API with autograd-enabled versions
+from .autograd import short_conv_fused_fn as short_conv_fused
+from .autograd import short_conv_update_fn as short_conv_update
+from .autograd import causal_conv1d_fn as causal_conv1d
