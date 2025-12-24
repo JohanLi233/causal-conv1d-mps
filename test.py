@@ -146,57 +146,6 @@ def test_causal_conv1d_mps(dim, seqlen, width, has_bias, silu_activation, itype)
     assert torch.allclose(out_mps, out_ref, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("itype", [torch.float32])
-@pytest.mark.parametrize("silu_activation", [False, True])
-@pytest.mark.parametrize("has_bias", [False, True])
-@pytest.mark.parametrize("width", [4])
-@pytest.mark.parametrize("seqlen", [8, 16, 32, 64])
-@pytest.mark.parametrize("dim", [64, 128])
-def test_short_conv_fused(dim, seqlen, width, has_bias, silu_activation, itype):
-    if not torch.backends.mps.is_available():
-        pytest.skip("MPS not available")
-
-    device = "mps"
-    if itype == torch.float32:
-        rtol, atol = (3e-4, 1e-3)
-    elif itype == torch.bfloat16:
-        rtol, atol = (5e-3, 2e-2)
-    else:
-        rtol, atol = (3e-3, 5e-3)
-
-    torch.random.manual_seed(42)
-    batch = 2
-
-    x = torch.randn(batch, seqlen, dim, device=device, dtype=itype)
-    weight = torch.randn(dim, width, device=device, dtype=torch.float32)
-    if has_bias:
-        bias = torch.randn(dim, device=device, dtype=torch.float32)
-    else:
-        bias = None
-
-    attention_mask = torch.ones(batch, seqlen, device=device, dtype=torch.float32)
-    for b in range(batch):
-        valid_len = torch.randint(seqlen // 2, seqlen, (1,)).item()
-        attention_mask[b, valid_len:] = 0
-
-    out_mps = causal_conv1d_mps.short_conv_fused(
-        x, weight, bias, attention_mask, activation=silu_activation, residual=True
-    )
-
-    x_masked = x * attention_mask.unsqueeze(-1)
-    x_transposed = x_masked.transpose(-1, -2).contiguous()
-
-    conv_out = causal_conv1d_reference(x_transposed, weight, bias, silu_activation)
-    conv_out = conv_out.transpose(-1, -2).to(device=device, dtype=itype)
-
-    out_ref = x + conv_out  # residual connection
-
-    print(f"Output max diff: {(out_mps - out_ref).abs().max().item()}")
-    print(f"Output mean diff: {(out_mps - out_ref).abs().mean().item()}")
-
-    assert torch.allclose(out_mps, out_ref, rtol=rtol, atol=atol)
-
-
 def test_edge_cases():
     if not torch.backends.mps.is_available():
         pytest.skip("MPS not available")
@@ -267,55 +216,6 @@ def test_gradients_causal_conv1d():
 
     def f():
         return causal_conv1d_mps.causal_conv1d_fn(x, weight, bias, activation="silu")
-
-    ok = check_gradients_numerical(f, [x, weight, bias], eps=1e-3)
-    assert ok
-
-
-def test_gradients_short_conv_fused():
-    if not torch.backends.mps.is_available():
-        pytest.skip("MPS not available")
-    device = torch.device("mps")
-    batch_size, seqlen, dim, width = 2, 8, 16, 4
-    x = torch.randn(batch_size, seqlen, dim, device=device, requires_grad=True)
-    weight = torch.randn(dim, width, device=device, requires_grad=True)
-    bias = torch.randn(dim, device=device, requires_grad=True)
-    attention_mask = torch.ones(batch_size, seqlen, device=device)
-
-    def f():
-        return causal_conv1d_mps.short_conv_fused_fn(
-            x, weight, bias, attention_mask, activation=True, residual=True
-        )
-
-    ok = check_gradients_numerical(f, [x, weight, bias], eps=1e-3)
-    assert ok
-
-
-def test_gradients_short_conv_update():
-    if not torch.backends.mps.is_available():
-        pytest.skip("MPS not available")
-    device = torch.device("mps")
-    batch_size, dim, width, state_len = 2, 8, 4, 8
-    x = torch.randn(batch_size, dim, device=device, requires_grad=True)
-    conv_state = torch.randn(
-        batch_size, dim, state_len, device=device, requires_grad=True
-    )
-    weight = torch.randn(dim, width, device=device, requires_grad=True)
-    bias = torch.randn(dim, device=device, requires_grad=True)
-    cache_seqlens = torch.randint(
-        0, state_len, (batch_size,), device=device, dtype=torch.int32
-    )
-
-    def f():
-        return causal_conv1d_mps.short_conv_update_fn(
-            x,
-            conv_state.clone(),
-            weight,
-            bias,
-            cache_seqlens,
-            activation=True,
-            residual=True,
-        )
 
     ok = check_gradients_numerical(f, [x, weight, bias], eps=1e-3)
     assert ok

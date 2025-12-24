@@ -1,6 +1,6 @@
 ## causal-conv1d-mps
 
-High-performance CausalConv1D for PyTorch on Apple Silicon using Metal/MPS. It provides optimized forward/backward kernels, a fused short-convolution kernel for common (B, T, D) usage, and stateful single-token update for inference.
+High-performance CausalConv1D for PyTorch on Apple Silicon using Metal/MPS. It provides optimized forward/backward kernels for causal convolution.
 
 - Backend: Apple Metal Performance Shaders (MPS)
 - Languages: Python + C++/Objective-C++ + Metal Shaders
@@ -9,10 +9,8 @@ High-performance CausalConv1D for PyTorch on Apple Silicon using Metal/MPS. It p
 
 
 ### Features
-- High-performance CausalConv1D: MPS backend with native Metal compute, optimized for both (B, D, T) and (B, T, D) layouts.
-- Fused short-convolution kernel: applies masking, convolution, SiLU activation, and residual in one pass for common short-convolution paths.
+- High-performance CausalConv1D: MPS backend with native Metal compute.
 - Autograd support: provided autograd functions with an optimized two-pass backward for the basic convolution (O(W) complexity).
-- Single-token update: stateful short-convolution update `short_conv_update` that updates the cache in-place for inference.
 
 
 ### Requirements
@@ -65,62 +63,12 @@ Shapes and device constraints:
 - `bias` (optional): (D), same dtype as `x`, on MPS
 - Returns: `(B, D, T)`
 
-
-#### Fused short-convolution ((B, T, D) path)
-```python
-import torch
-import causal_conv1d_mps as ccmps
-
-B, T, D, W = 2, 256, 768, 4
-x = torch.randn(B, T, D, device='mps', dtype=torch.float32)
-weight = torch.randn(D, W, device='mps', dtype=x.dtype)
-bias = torch.randn(D, device='mps', dtype=x.dtype)
-mask = torch.ones(B, T, device='mps', dtype=x.dtype)  # optional
-
-y = ccmps.short_conv_fused(
-    x, weight, bias, mask,
-    activation=True,   # SiLU
-    residual=True      # y += x
-)
-```
-
-Mask is normalized to `(B, T)`. Supported shapes: `(B, T)`, `(1, T)`, `(B, 1)`, `(T, B)`, or 1D of length `T/B/(B*T)`.
-
-
-#### Single-token incremental update (inference)
-```python
-import torch
-import causal_conv1d_mps as ccmps
-
-B, D, W, STATE = 2, 512, 4, 8
-x = torch.randn(B, D, device='mps', dtype=torch.float32)
-conv_state = torch.zeros(B, D, STATE, device='mps', dtype=x.dtype)  # updated in-place
-weight = torch.randn(D, W, device='mps', dtype=x.dtype)
-bias = torch.randn(D, device='mps', dtype=x.dtype)
-cache_seqlens = torch.zeros(B, device='mps', dtype=torch.int32)  # track current position per batch
-
-y = ccmps.short_conv_update(
-    x, conv_state, weight, bias, cache_seqlens,
-    activation=True, residual=True
-)
-# increment cache_seqlens after use
-cache_seqlens += 1
-```
-
-Requirements:
-- `x`: (B, D); `conv_state`: (B, D, STATE_LEN); `weight`: (D, 4); `cache_seqlens`: (B,), int32
-- Returns: (B, D). `conv_state` is updated in place.
-
-
 ### Python API Overview
 - Autograd-enabled (recommended):
   - `causal_conv1d(x, weight, bias=None, activation=None) -> (B, D, T)`
     - `activation ∈ {None, 'silu', 'swish'}`
-  - `short_conv_fused(x, weight, bias=None, attention_mask=None, activation=True, residual=True) -> (B, T, D)`
-  - `short_conv_update(x, conv_state, weight, bias=None, cache_seqlens=None, activation=True, residual=True) -> (B, D)`
 - Forward-only (low-level wrappers):
   - `causal_conv1d_fwd(x, weight, bias=None, silu_activation=False) -> (B, D, T)`
-  - `short_conv_fused_fwd_only(...)`, `short_conv_update_fwd_only(...)` (forward-only aliases)
 
 Common constraints:
 - All tensors must be on the MPS device and share the same dtype
@@ -158,31 +106,6 @@ Config               MPS+SiLU(ms)   PyTorch+SiLU(ms)  Speedup    MPS_StdDev(%)
 
 📊 Performance test completed!
 💡 Tip: Speedup > 1.0 means MPS is faster. StdDev(%) smaller means more stable test results.
-
-🧪 Canon scene (B,T,D interface) benchmark
-Config                   MPS(ms)    PyTorch(ms)  Speedup    MPS_StdDev(%)   Correct
-------------------------------------------------------------------------------------------------
-B1 T128 D512 W4          0.01       0.05         4.39       9.64            ✅
-B2 T256 D768 W4          0.02       0.05         2.16       3.29            ✅
-B4 T512 D1024 W4         0.09       0.14         1.59       1.65            ✅
-
-🧪 Scene (Optimized Fused): CanonA/C (B,T,D + Fused Kernel)
-Config                       MPS(ms)    PyTorch(ms)  Speedup    MPS_StdDev(%)   Correct
---------------------------------------------------------------------------------------------------------
-B2 T256 D768 W4              0.02       0.07         3.98       6.45            ✅
-B4 T512 D1024 W4             0.06       0.32         5.29       1.62            ✅
-
-🧪 Scene (Optimized Fused): CanonB (QKV concat + Fused Kernel)
-Config                                   MPS(ms)    PyTorch(ms)  Speedup    MPS_StdDev(%)   Correct
-----------------------------------------------------------------------------------------------------------------------
-B2 T256 H12 KV4 hd64 W4                  0.03       0.11         3.96       2.21            ✅
-B2 T512 H16 KV8 hd64 W4                  0.07       0.32         4.81       2.02            ✅
-
-🧪 Scene (Optimized Fused): CanonD (MLP Gate&Up concat + Fused Kernel)
-Config                              MPS(ms)    PyTorch(ms)  Speedup    MPS_StdDev(%)   Correct
------------------------------------------------------------------------------------------------------------------
-B2 T256 H768 I2048 W4               0.06       0.35         6.06       3.33            ✅
-B2 T512 H1024 I4096 W4              0.20       1.20         6.01       3.63            ✅
 ```
 
 
@@ -194,5 +117,3 @@ python test.py
 
 ### License
 MIT
-
-
